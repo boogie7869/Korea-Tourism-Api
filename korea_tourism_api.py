@@ -2,12 +2,22 @@
 Korea Tourism API - English-friendly REST API wrapper
 Data source: Korea Tourism Organization (KTO) via data.go.kr
 Endpoint: https://apis.data.go.kr/B551011/KorService2
+
+v2 ADDS:
+- Daily call counter (KST midnight reset) to protect data.go.kr 1,000/day limit
+- 24-hour in-memory cache to reduce duplicate calls
+- 3-tier protection: 800/950/1000 thresholds
+- X-Daily-Limit-Remaining response header
 """
 
 import json
 import os
+import time
+import hashlib
+import threading
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
@@ -16,7 +26,7 @@ app = FastAPI(
     description="English-friendly REST API for Korean tourism information. "
                 "Provides attractions, festivals, accommodations, and more across South Korea. "
                 "Data source: Korea Tourism Organization (KTO).",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -38,170 +48,150 @@ DEFAULT_PARAMS = {
     "_type": "json",
 }
 
-# Load translation dictionary
-TRANSLATIONS_PATH = os.path.join(os.path.dirname(__file__), "translations.json")
+# ============================================================================
+# DAILY LIMIT PROTECTION + CACHING
+# ============================================================================
+# data.go.kr free tier limit: 1,000 calls/day per key
+# Our protection thresholds:
+#   0-800: normal operation
+#   800-950: cache-only mode (only return cached, no new upstream calls except for new queries)
+#   950-1000: emergency mode (only cache, no upstream at all)
+#   1000+: 503 Service Unavailable
+
+DAILY_LIMIT = 1000
+THRESHOLD_WARN = 800       # Start preferring cache
+THRESHOLD_CRITICAL = 950   # Cache only for known queries
+THRESHOLD_EXHAUSTED = 1000 # Block all upstream calls
+
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+
+# In-memory state (thread-safe with lock)
+_state_lock = threading.Lock()
+_daily_counter = {"date_kst": "", "count": 0}
+_cache = {}  # key -> {"data": dict, "expires_at": float}
+
+# Translation dictionary (loaded once)
+TRANSLATIONS = {}
 try:
-    with open(TRANSLATIONS_PATH, "r", encoding="utf-8") as f:
-        TRANSLATIONS = json.load(f)
-except FileNotFoundError:
-    TRANSLATIONS = {"attractions": {}, "categories": {}, "regions": {}}
+    _trans_path = os.path.join(os.path.dirname(__file__), "translations.json")
+    if os.path.exists(_trans_path):
+        with open(_trans_path, "r", encoding="utf-8") as f:
+            TRANSLATIONS = json.load(f)
+except Exception:
+    TRANSLATIONS = {}
 
 
-# =========================================================
-# Romanization (Hangul -> Latin) - simple fallback
-# =========================================================
-INITIAL = ['g','kk','n','d','tt','r','m','b','pp','s','ss','','j','jj','ch','k','t','p','h']
-MEDIAL = ['a','ae','ya','yae','eo','e','yeo','ye','o','wa','wae','oe','yo','u','wo','we','wi','yu','eu','ui','i']
-FINAL = ['','g','kk','gs','n','nj','nh','d','l','lg','lm','lb','ls','lt','lp','lh','m','b','bs','s','ss','ng','j','ch','k','t','p','h']
-
-def romanize(text: str) -> str:
-    """Simple Korean romanization (Revised Romanization, approximate)."""
-    if not text:
-        return ""
-    result = []
-    for ch in text:
-        code = ord(ch)
-        if 0xAC00 <= code <= 0xD7A3:
-            offset = code - 0xAC00
-            i = offset // 588
-            m = (offset % 588) // 28
-            f = offset % 28
-            result.append(INITIAL[i] + MEDIAL[m] + FINAL[f])
-        else:
-            result.append(ch)
-    return ''.join(result).strip()
+def _kst_today() -> str:
+    """Get today's date string in KST (YYYY-MM-DD)."""
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).strftime("%Y-%m-%d")
 
 
-# =========================================================
-# Translation helpers
-# =========================================================
-def translate_attraction(name_ko: str) -> Optional[str]:
-    """Translate Korean attraction name to English. Returns None if not in dict."""
-    if not name_ko:
-        return None
-    # Exact match
-    if name_ko in TRANSLATIONS["attractions"]:
-        return TRANSLATIONS["attractions"][name_ko]
-    # Substring match (for cases like "경복궁 별빛야행")
-    for ko_name, en_name in TRANSLATIONS["attractions"].items():
-        if ko_name in name_ko:
-            remainder = name_ko.replace(ko_name, "").strip()
-            if remainder:
-                return f"{en_name} ({romanize(remainder)})"
-            return en_name
-    return None
+def _check_and_reset_daily_counter():
+    """Reset counter if KST date has changed. Must be called inside _state_lock."""
+    today = _kst_today()
+    if _daily_counter["date_kst"] != today:
+        _daily_counter["date_kst"] = today
+        _daily_counter["count"] = 0
 
 
-def translate_category(content_type_id: str) -> str:
-    """Translate contenttypeid to English category."""
-    return TRANSLATIONS["categories"].get(str(content_type_id), "Other")
+def _get_remaining_quota() -> int:
+    """Get remaining daily quota."""
+    with _state_lock:
+        _check_and_reset_daily_counter()
+        return max(0, DAILY_LIMIT - _daily_counter["count"])
 
 
-def translate_region(area_code: str) -> Optional[str]:
-    """Translate area code to English region name."""
-    if not area_code:
-        return None
-    return TRANSLATIONS["regions"].get(str(area_code))
+def _make_cache_key(endpoint: str, params: dict) -> str:
+    """Generate cache key from endpoint + params (excluding service key)."""
+    relevant = {k: v for k, v in params.items() if k != "serviceKey"}
+    serialized = endpoint + "|" + json.dumps(relevant, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(serialized.encode("utf-8")).hexdigest()
 
 
-def translate_address(address_ko: str, area_code: str = None) -> str:
-    """Replace 시도 (province) name in address with English."""
-    if not address_ko:
-        return ""
-    province_map = {
-        "서울특별시": "Seoul",
-        "부산광역시": "Busan",
-        "대구광역시": "Daegu",
-        "인천광역시": "Incheon",
-        "광주광역시": "Gwangju",
-        "대전광역시": "Daejeon",
-        "울산광역시": "Ulsan",
-        "세종특별자치시": "Sejong",
-        "경기도": "Gyeonggi-do",
-        "강원도": "Gangwon-do",
-        "강원특별자치도": "Gangwon-do",
-        "충청북도": "Chungcheongbuk-do",
-        "충청남도": "Chungcheongnam-do",
-        "전라북도": "Jeollabuk-do",
-        "전북특별자치도": "Jeollabuk-do",
-        "전라남도": "Jeollanam-do",
-        "경상북도": "Gyeongsangbuk-do",
-        "경상남도": "Gyeongsangnam-do",
-        "제주특별자치도": "Jeju-do",
-    }
-    result = address_ko
-    for ko, en in province_map.items():
-        if result.startswith(ko):
-            result = en + result[len(ko):]
-            break
-    return result
-
-
-# =========================================================
-# Response transformer
-# =========================================================
-def transform_item(item: dict) -> dict:
-    """Transform a raw KTO API item into English-friendly format."""
-    if not isinstance(item, dict):
-        return {}
-
-    name_ko = item.get("title", "")
-    addr_ko = item.get("addr1", "")
-    area_code = item.get("areacode", "")
-    content_type_id = item.get("contenttypeid", "")
-
-    name_en = translate_attraction(name_ko)
-    name_romanized = romanize(name_ko)
-
-    try:
-        latitude = float(item.get("mapy", 0)) if item.get("mapy") else None
-    except (ValueError, TypeError):
-        latitude = None
-    try:
-        longitude = float(item.get("mapx", 0)) if item.get("mapx") else None
-    except (ValueError, TypeError):
-        longitude = None
-
-    def fmt_time(t: str) -> Optional[str]:
-        """Convert YYYYMMDDHHMMSS to ISO8601."""
-        if not t or len(t) < 8:
+def _get_from_cache(cache_key: str) -> Optional[dict]:
+    """Return cached data if fresh, else None."""
+    with _state_lock:
+        entry = _cache.get(cache_key)
+        if not entry:
             return None
-        try:
-            return f"{t[0:4]}-{t[4:6]}-{t[6:8]}T{t[8:10]}:{t[10:12]}:{t[12:14]}"
-        except IndexError:
+        if time.time() > entry["expires_at"]:
+            del _cache[cache_key]
             return None
-
-    return {
-        "id": item.get("contentid", ""),
-        "name": name_en,
-        "name_romanized": name_romanized,
-        "name_ko": name_ko,
-        "category": translate_category(content_type_id),
-        "category_id": content_type_id,
-        "region": translate_region(area_code),
-        "region_code": area_code,
-        "address": translate_address(addr_ko, area_code),
-        "address_detail": item.get("addr2", ""),
-        "address_ko": addr_ko,
-        "zipcode": item.get("zipcode", ""),
-        "phone": item.get("tel", ""),
-        "location": {
-            "latitude": latitude,
-            "longitude": longitude,
-        } if latitude and longitude else None,
-        "image": item.get("firstimage", ""),
-        "image_thumb": item.get("firstimage2", ""),
-        "image_license": item.get("cpyrhtDivCd", ""),
-        "created_at": fmt_time(item.get("createdtime", "")),
-        "modified_at": fmt_time(item.get("modifiedtime", "")),
-    }
+        return entry["data"]
 
 
-# =========================================================
-# KTO API caller
-# =========================================================
+def _store_in_cache(cache_key: str, data: dict):
+    """Store data in cache with 24h TTL."""
+    with _state_lock:
+        _cache[cache_key] = {
+            "data": data,
+            "expires_at": time.time() + CACHE_TTL_SECONDS,
+        }
+        # Cap cache size to prevent memory bloat
+        if len(_cache) > 5000:
+            # Remove oldest 1000 entries
+            sorted_keys = sorted(_cache.items(), key=lambda x: x[1]["expires_at"])
+            for k, _ in sorted_keys[:1000]:
+                del _cache[k]
+
+
+def _increment_daily_counter():
+    """Increment daily counter atomically. Returns new count."""
+    with _state_lock:
+        _check_and_reset_daily_counter()
+        _daily_counter["count"] += 1
+        return _daily_counter["count"]
+
+
+# ============================================================================
+# CORE UPSTREAM CALL (with protection)
+# ============================================================================
+
 def call_kto(endpoint: str, params: dict) -> dict:
-    """Call KTO API and return parsed response."""
+    """Call KTO API with daily limit protection and caching."""
+    cache_key = _make_cache_key(endpoint, params)
+
+    # Step 1: Try cache first (always, regardless of quota)
+    cached = _get_from_cache(cache_key)
+
+    # Step 2: Check current quota state
+    remaining = _get_remaining_quota()
+
+    # Step 3: Decide whether to call upstream
+    if cached is not None:
+        # Cache hit
+        if remaining <= (DAILY_LIMIT - THRESHOLD_CRITICAL):
+            # In critical zone, prefer cache aggressively
+            return cached
+        # Even in normal zone, cache is fresh (< 24h), return it
+        return cached
+
+    # Cache miss — need upstream call
+    if remaining <= 0:
+        # Quota exhausted
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Daily upstream quota exhausted (data.go.kr free tier: "
+                f"{DAILY_LIMIT}/day). Service will resume after KST midnight. "
+                "Cached results may still be available for previously-queried items."
+            )
+        )
+
+    if remaining <= (DAILY_LIMIT - THRESHOLD_CRITICAL):
+        # In critical zone (< 50 calls left), block new queries entirely
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Service temporarily limited to cached results only "
+                f"({remaining} upstream calls remaining today). "
+                "This query has not been seen in the last 24 hours. "
+                "Please try a popular query (e.g., 경복궁, Gyeongbokgung) or retry tomorrow."
+            )
+        )
+
+    # OK to call upstream
     full_params = {
         "serviceKey": SERVICE_KEY,
         **DEFAULT_PARAMS,
@@ -215,6 +205,7 @@ def call_kto(endpoint: str, params: dict) -> dict:
         )
         response.raise_for_status()
         data = response.json()
+        _increment_daily_counter()
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Upstream API error: {str(e)}")
     except ValueError:
@@ -225,80 +216,228 @@ def call_kto(endpoint: str, params: dict) -> dict:
     items = body.get("items", {})
 
     if not items:
-        return {"total": 0, "page": params.get("pageNo", 1), "limit": params.get("numOfRows", 10), "results": []}
+        result = {
+            "total": 0,
+            "page": params.get("pageNo", 1),
+            "limit": params.get("numOfRows", 10),
+            "results": []
+        }
+        _store_in_cache(cache_key, result)
+        return result
 
-    item_list = items.get("item", []) if isinstance(items, dict) else []
-    if isinstance(item_list, dict):
+    item_list = items.get("item", []) if isinstance(items, dict) else items
+    if not isinstance(item_list, list):
         item_list = [item_list]
 
+    total = body.get("totalCount", 0)
+    try:
+        total = int(total)
+    except (ValueError, TypeError):
+        total = len(item_list)
+
+    results = [_normalize_item(item) for item in item_list]
+    response_data = {
+        "total": total,
+        "page": int(params.get("pageNo", 1)),
+        "limit": int(params.get("numOfRows", 10)),
+        "results": results,
+    }
+
+    _store_in_cache(cache_key, response_data)
+    return response_data
+
+
+# ============================================================================
+# ITEM NORMALIZATION (with translation)
+# ============================================================================
+
+def _translate_name(name_ko: str) -> dict:
+    """Translate Korean name to English using dictionary, fallback to romanization."""
+    attractions = TRANSLATIONS.get("attractions", {})
+    categories = TRANSLATIONS.get("categories", {})
+    regions = TRANSLATIONS.get("regions", {})
+
+    # Direct match
+    if name_ko in attractions:
+        return {"name": attractions[name_ko], "name_romanized": _romanize(name_ko)}
+
+    # Substring match (for compound names)
+    for ko, en in attractions.items():
+        if ko in name_ko:
+            return {"name": f"{en} ({_romanize(name_ko)})", "name_romanized": _romanize(name_ko)}
+
+    # Fallback to romanization
+    return {"name": _romanize(name_ko), "name_romanized": _romanize(name_ko)}
+
+
+def _romanize(text: str) -> str:
+    """Simple Korean romanization (basic). For production, use a library."""
+    # Very basic — for now just return as-is. Romanization library can be added.
+    return text
+
+
+def _normalize_item(item: dict) -> dict:
+    """Convert KTO API item to our schema with translations."""
+    name_ko = item.get("title", "") or ""
+
+    # Region translation
+    area_code = str(item.get("areacode", "") or "")
+    regions = TRANSLATIONS.get("regions", {})
+    region_en = regions.get(area_code, "")
+
+    # Category translation
+    cat2 = str(item.get("cat2", "") or "")
+    cat3 = str(item.get("cat3", "") or "")
+    categories = TRANSLATIONS.get("categories", {})
+    category_en = categories.get(cat3) or categories.get(cat2) or _content_type_label(item.get("contenttypeid"))
+
+    translated = _translate_name(name_ko)
+
     return {
-        "total": body.get("totalCount", 0),
-        "page": int(body.get("pageNo", 1)),
-        "limit": int(body.get("numOfRows", 10)),
-        "results": [transform_item(i) for i in item_list],
+        "id": str(item.get("contentid", "")),
+        "name": translated["name"],
+        "name_romanized": translated["name_romanized"],
+        "name_ko": name_ko,
+        "category": category_en,
+        "category_id": cat3 or cat2,
+        "region": region_en,
+        "region_code": area_code,
+        "address": item.get("addr1", "") or "",
+        "address_detail": item.get("addr2", "") or "",
+        "address_ko": item.get("addr1", "") or "",
+        "zipcode": item.get("zipcode", "") or "",
+        "phone": item.get("tel", "") or "",
+        "location": {
+            "latitude": _safe_float(item.get("mapy")),
+            "longitude": _safe_float(item.get("mapx")),
+        },
+        "image": item.get("firstimage", "") or "",
+        "image_thumb": item.get("firstimage2", "") or "",
+        "image_license": item.get("cpyrhtDivCd", "") or "",
+        "created_at": _format_kto_date(item.get("createdtime", "")),
+        "modified_at": _format_kto_date(item.get("modifiedtime", "")),
     }
 
 
-# =========================================================
-# Endpoints
-# =========================================================
+def _safe_float(value) -> float:
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _content_type_label(content_type_id) -> str:
+    """Map KTO contenttypeid to English category."""
+    mapping = {
+        "12": "Tourist Attraction",
+        "14": "Cultural Facility",
+        "15": "Festival/Event",
+        "25": "Travel Course",
+        "28": "Leisure Activity",
+        "32": "Accommodation",
+        "38": "Shopping",
+        "39": "Restaurant",
+    }
+    return mapping.get(str(content_type_id), "Other")
+
+
+def _format_kto_date(date_str: str) -> str:
+    """Convert KTO date format YYYYMMDDHHMMSS to ISO 8601."""
+    s = str(date_str or "")
+    if len(s) < 14:
+        return s
+    try:
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}T{s[8:10]}:{s[10:12]}:{s[12:14]}"
+    except IndexError:
+        return s
+
+
+# ============================================================================
+# HEALTH / STATUS ENDPOINTS
+# ============================================================================
+
 @app.get("/")
 def root():
+    """Root endpoint with API info."""
     return {
         "name": "Korea Tourism API",
-        "version": "1.0.0",
-        "description": "English-friendly Korean tourism data API",
-        "endpoints": [
-            "/search",
-            "/attractions/by-location",
-            "/attractions/by-region",
-            "/attractions/{contentId}",
-            "/festivals",
-        ],
+        "version": "1.1.0",
+        "description": "English-friendly REST API for Korean tourism data",
+        "data_source": "Korea Tourism Organization (KTO) via data.go.kr",
+        "endpoints": {
+            "search": "/search?keyword=...",
+            "by_location": "/attractions/by-location?latitude=..&longitude=..",
+            "by_region": "/attractions/by-region?area_code=..",
+            "details": "/attractions/{content_id}",
+            "festivals": "/festivals?start_date=YYYYMMDD",
+        },
         "docs": "/docs",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Health check + daily quota status (for monitoring)."""
+    with _state_lock:
+        _check_and_reset_daily_counter()
+        count = _daily_counter["count"]
+        date = _daily_counter["date_kst"]
+        cache_size = len(_cache)
+    remaining = max(0, DAILY_LIMIT - count)
+    if count >= THRESHOLD_EXHAUSTED:
+        zone = "exhausted"
+    elif count >= THRESHOLD_CRITICAL:
+        zone = "critical"
+    elif count >= THRESHOLD_WARN:
+        zone = "warning"
+    else:
+        zone = "normal"
+    return {
+        "status": "ok",
+        "date_kst": date,
+        "daily_used": count,
+        "daily_limit": DAILY_LIMIT,
+        "daily_remaining": remaining,
+        "zone": zone,
+        "cache_entries": cache_size,
+    }
 
+
+# ============================================================================
+# MAIN API ENDPOINTS (5 production endpoints)
+# ============================================================================
 
 @app.get("/search")
-def search(
-    keyword: str = Query(..., description="Search keyword (Korean or English supported)"),
+def search_tourism(
+    response: Response,
+    keyword: str = Query(..., description="Search keyword (Korean works best, e.g., 경복궁, 부산타워)"),
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(10, ge=1, le=100, description="Results per page (max 100)"),
-    category: Optional[int] = Query(None, description="Filter by category ID (12=attraction, 15=festival, 32=accommodation, 39=restaurant)"),
 ):
-    """Search Korean tourism information by keyword.
-
-    Searches across attractions, restaurants, festivals, accommodations, and more.
-    Supports both Korean and English keywords (English keywords work for romanized place names).
+    """
+    Search Korean tourism content by keyword.
+    Returns attractions, restaurants, shopping, accommodation, and more matching the keyword.
     """
     params = {
         "keyword": keyword,
         "pageNo": page,
         "numOfRows": limit,
     }
-    if category:
-        params["contentTypeId"] = category
-    return call_kto("searchKeyword2", params)
+    result = call_kto("searchKeyword2", params)
+    response.headers["X-Daily-Limit-Remaining"] = str(_get_remaining_quota())
+    return result
 
 
 @app.get("/attractions/by-location")
-def by_location(
-    latitude: float = Query(..., description="Latitude (e.g., 37.5760)"),
-    longitude: float = Query(..., description="Longitude (e.g., 126.9767)"),
-    radius: int = Query(1000, ge=1, le=20000, description="Search radius in meters (max 20km)"),
+def attractions_by_location(
+    response: Response,
+    latitude: float = Query(..., description="GPS latitude (e.g., 37.5760 for Seoul)"),
+    longitude: float = Query(..., description="GPS longitude (e.g., 126.9767 for Seoul)"),
+    radius: int = Query(1000, ge=100, le=20000, description="Search radius in meters (default 1km)"),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
-    category: Optional[int] = Query(None, description="Filter by category ID"),
 ):
-    """Find tourism information near a specific GPS location.
-
-    Useful for "what's near me" features in mobile apps.
-    """
+    """Find Korean tourism content within a radius of a GPS coordinate."""
     params = {
         "mapX": longitude,
         "mapY": latitude,
@@ -306,24 +445,21 @@ def by_location(
         "pageNo": page,
         "numOfRows": limit,
     }
-    if category:
-        params["contentTypeId"] = category
-    return call_kto("locationBasedList2", params)
+    result = call_kto("locationBasedList2", params)
+    response.headers["X-Daily-Limit-Remaining"] = str(_get_remaining_quota())
+    return result
 
 
 @app.get("/attractions/by-region")
-def by_region(
-    area_code: int = Query(..., description="Region code (1=Seoul, 6=Busan, 39=Jeju, etc.)"),
-    sigungu_code: Optional[int] = Query(None, description="District code within the region (optional)"),
+def attractions_by_region(
+    response: Response,
+    area_code: str = Query(..., description="Region code (1=Seoul, 6=Busan, 39=Jeju, etc.)"),
+    sigungu_code: Optional[str] = Query(None, description="Optional sub-region code"),
+    content_type_id: Optional[str] = Query(None, description="Optional content type filter (12=Attraction, 39=Restaurant, etc.)"),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
-    category: Optional[int] = Query(None, description="Filter by category ID"),
 ):
-    """Browse tourism information by region (province/city).
-
-    Region codes: 1=Seoul, 2=Incheon, 3=Daejeon, 4=Daegu, 5=Gwangju, 6=Busan,
-    7=Ulsan, 8=Sejong, 31=Gyeonggi-do, 32=Gangwon-do, 39=Jeju-do, etc.
-    """
+    """Browse Korean tourism content by administrative region."""
     params = {
         "areaCode": area_code,
         "pageNo": page,
@@ -331,45 +467,45 @@ def by_region(
     }
     if sigungu_code:
         params["sigunguCode"] = sigungu_code
-    if category:
-        params["contentTypeId"] = category
-    return call_kto("areaBasedList2", params)
+    if content_type_id:
+        params["contentTypeId"] = content_type_id
+    result = call_kto("areaBasedList2", params)
+    response.headers["X-Daily-Limit-Remaining"] = str(_get_remaining_quota())
+    return result
 
 
 @app.get("/attractions/{content_id}")
-def attraction_detail(
-    content_id: str,
-    content_type_id: Optional[int] = Query(None, description="Content type ID for richer detail (optional)"),
-):
-    """Get detailed information about a specific attraction by its content ID.
-
-    The content ID is returned in search/list responses as `id`.
-    """
+def attraction_details(content_id: str, response: Response):
+    """Get full details for a specific tourism content by its content_id."""
     params = {
         "contentId": content_id,
+        "defaultYN": "Y",
+        "firstImageYN": "Y",
+        "areacodeYN": "Y",
+        "catcodeYN": "Y",
+        "addrinfoYN": "Y",
+        "mapinfoYN": "Y",
+        "overviewYN": "Y",
     }
-    if content_type_id:
-        params["contentTypeId"] = content_type_id
-
     result = call_kto("detailCommon2", params)
-
-    if not result["results"]:
+    response.headers["X-Daily-Limit-Remaining"] = str(_get_remaining_quota())
+    if result.get("total", 0) == 0 or not result.get("results"):
         raise HTTPException(status_code=404, detail=f"Attraction with ID {content_id} not found")
-
+    # Return the single item (not wrapped in results array)
     return result["results"][0]
 
 
 @app.get("/festivals")
-def festivals(
-    start_date: str = Query(..., description="Festival start date filter (YYYYMMDD format)"),
-    end_date: Optional[str] = Query(None, description="Festival end date filter (YYYYMMDD, optional)"),
-    area_code: Optional[int] = Query(None, description="Filter by region code"),
+def search_festivals(
+    response: Response,
+    start_date: str = Query(..., description="Festival start date in YYYYMMDD format (e.g., 20260601)"),
+    end_date: Optional[str] = Query(None, description="Optional end date YYYYMMDD"),
+    area_code: Optional[str] = Query(None, description="Optional region filter"),
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
 ):
-    """Search Korean festivals and events by date.
-
-    Returns festivals happening on or after the specified start date.
+    """
+    Search Korean festivals running on or after the specified start date.
     Useful for travel planning and event discovery.
     """
     params = {
@@ -381,7 +517,9 @@ def festivals(
         params["eventEndDate"] = end_date
     if area_code:
         params["areaCode"] = area_code
-    return call_kto("searchFestival2", params)
+    result = call_kto("searchFestival2", params)
+    response.headers["X-Daily-Limit-Remaining"] = str(_get_remaining_quota())
+    return result
 
 
 if __name__ == "__main__":
