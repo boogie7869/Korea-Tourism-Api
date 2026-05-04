@@ -475,23 +475,21 @@ def attractions_by_region(
 
 
 @app.get("/attractions/{content_id}")
-def attraction_details(content_id: str, response: Response):
-    """Get full details for a specific tourism content by its content_id."""
+def attraction_details(
+    content_id: str,
+    response: Response,
+    content_type_id: Optional[int] = Query(None, description="Content type ID for richer detail (optional)"),
+):
+    """Get detailed information about a specific attraction by its content ID."""
     params = {
         "contentId": content_id,
-        "defaultYN": "Y",
-        "firstImageYN": "Y",
-        "areacodeYN": "Y",
-        "catcodeYN": "Y",
-        "addrinfoYN": "Y",
-        "mapinfoYN": "Y",
-        "overviewYN": "Y",
     }
+    if content_type_id:
+        params["contentTypeId"] = content_type_id
     result = call_kto("detailCommon2", params)
     response.headers["X-Daily-Limit-Remaining"] = str(_get_remaining_quota())
-    if result.get("total", 0) == 0 or not result.get("results"):
+    if not result.get("results"):
         raise HTTPException(status_code=404, detail=f"Attraction with ID {content_id} not found")
-    # Return the single item (not wrapped in results array)
     return result["results"][0]
 
 
